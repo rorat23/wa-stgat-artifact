@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+
+# IDE
+.vscode/
+.idea/
+
+
+# Credentials
+.env
+*.pem
+credentials.json
+
+
+# Large data
+data/raw/
+data/processed/
+*.parquet
+*.pkl
+
+
+# Models
+checkpoints/
+*.pt
+*.pth
+results/*.pth
+
+
+# Local outputs
+logs/
+.DS_Store
+Thumbs.db
