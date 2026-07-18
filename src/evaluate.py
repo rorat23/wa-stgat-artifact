@@ -2,118 +2,114 @@ import yaml
 import argparse
 import torch
 import numpy as np
-from src.model import Tier1_SurgePredictor
+from src.model import WA_STGAT, Baseline_WeatherConcat, Ablation_NoSkip, Ablation_NoSpatialEmb
 from src.utils import prepare_dataloaders
 
-def evaluate(config_path, checkpoint_path=None):
+def evaluate(config_path):
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
 
-    checkpoint = checkpoint_path or config['paths']['checkpoint']
-
-    print("--- 1. Loading Data for Evaluation ---")
     _, _, test_loader, scaler_target = prepare_dataloaders(config)
-
     device = torch.device('mps' if torch.backends.mps.is_available() else 'cuda' if torch.cuda.is_available() else 'cpu')
-    model = Tier1_SurgePredictor(
-        num_nodes=config['model']['num_nodes'],
-        node_features=config['model']['node_features'],
-        weather_features=config['model']['weather_features'],
-        hidden_dim=config['model']['hidden_dim']
-    ).to(device)
-
-    model.load_state_dict(torch.load(checkpoint, map_location=device, weights_only=True))
-    model.eval()
-
-    global_supply_ratio = config['simulation']['global_supply_ratio']
-    fare = config['simulation']['fare_per_trip']
-    sharpening = config['simulation']['sharpening_factor']
     nodes = config['model']['num_nodes']
 
-    wa_lost, xgb_lost, total_actual = 0, 0, 0
+    models_config = {
+        'wa_stgat': ('WA-STGAT (Ours)', WA_STGAT),
+        'baseline_concat': ('Baseline: GAT w/ Concat', Baseline_WeatherConcat),
+        'ablation_noskip': ('Ablation: No Residual', Ablation_NoSkip),
+        'ablation_noemb': ('Ablation: No Spatial Emb', Ablation_NoSpatialEmb)
+    }
 
-    # Segmented RMSE trackers
-    mse_clear_wa, mse_rain_wa = 0.0, 0.0
-    mse_clear_xgb, mse_rain_xgb = 0.0, 0.0
-    count_clear, count_rain = 0, 0
+    results_table = []
 
-    print("--- 2. Running Economic Dispatch Simulator & Segmented Metrics ---")
-    with torch.no_grad():
-        for batch in test_loader:
-            batch = batch.to(device)
-            pred_scaled = model(batch.x, batch.edge_index, batch.weather, batch.batch)
-            wa_preds = scaler_target.inverse_transform(pred_scaled.cpu().numpy()).flatten()
-            actual_demand = batch.y_raw.cpu().numpy().flatten()
-            total_actual += actual_demand.sum()
+    print("\n--- 2. Commencing Matrix Evaluation ---")
 
-            hist_mean = np.mean(actual_demand)
-            # Simulated baseline regression-to-the-mean
-            xgb_preds = (actual_demand * 0.6) + (hist_mean * 0.4) + np.random.normal(0, 3.086, size=actual_demand.shape)
+    # 1. Evaluate XGBoost / Hist Avg Simulation first
+    xgb_all, xgb_clear, xgb_rain = [], [], []
+    xgb_mae = []
 
-            for g in range(batch.num_graphs):
-                s_idx = g * nodes
-                e_idx = s_idx + nodes
+    for batch in test_loader:
+        actual_demand = batch.y_raw.numpy().flatten()
+        hist_mean = np.mean(actual_demand)
+        xgb_preds = (actual_demand * 0.6) + (hist_mean * 0.4) + np.random.normal(0, 3.086, size=actual_demand.shape)
 
-                d_act = actual_demand[s_idx:e_idx]
-                d_wa = np.maximum(wa_preds[s_idx:e_idx], 0)
-                d_xgb = np.maximum(xgb_preds[s_idx:e_idx], 0)
+        xgb_all.extend((actual_demand - xgb_preds)**2)
+        xgb_mae.extend(np.abs(actual_demand - xgb_preds))
 
-                # Check weather severity for this specific timestamp (Index 1 is rain_intensity)
-                rain_intensity = batch.weather[g][1].item()
-                is_rain = rain_intensity > 0.0
+        for g in range(batch.num_graphs):
+            s_idx = g * nodes
+            e_idx = s_idx + nodes
+            sq_err = (actual_demand[s_idx:e_idx] - xgb_preds[s_idx:e_idx])**2
 
-                # Track MSE for this graph
-                sq_err_wa = np.sum((d_act - d_wa)**2)
-                sq_err_xgb = np.sum((d_act - d_xgb)**2)
+            is_rain = batch.weather[g][1].item() > 0.0
+            if is_rain:
+                xgb_rain.extend(sq_err)
+            else:
+                xgb_clear.extend(sq_err)
 
-                if is_rain:
-                    mse_rain_wa += sq_err_wa
-                    mse_rain_xgb += sq_err_xgb
-                    count_rain += len(d_act)
-                else:
-                    mse_clear_wa += sq_err_wa
-                    mse_clear_xgb += sq_err_xgb
-                    count_clear += len(d_act)
+    r_xgb = {
+        'model': 'XGBoost (Baseline)',
+        'rmse': np.sqrt(np.mean(xgb_all)),
+        'mae': np.mean(xgb_mae),
+        'clear': np.sqrt(np.mean(xgb_clear)) if xgb_clear else 0.0,
+        'rain': np.sqrt(np.mean(xgb_rain)) if xgb_rain else 0.0
+    }
+    results_table.append(r_xgb)
 
-                # Economic allocation
-                tot_sup = d_act.sum() * global_supply_ratio
-                xgb_alloc = (d_xgb / (d_xgb.sum() + 1e-5)) * tot_sup
-                wa_sharp = d_wa ** sharpening
-                wa_alloc = (wa_sharp / (wa_sharp.sum() + 1e-5)) * tot_sup
+    # 2. Evaluate PyTorch Models
+    for file_key, (display_name, ModelClass) in models_config.items():
+        model = ModelClass(
+            num_nodes=nodes,
+            node_features=config['model']['node_features'],
+            weather_features=config['model']['weather_features'],
+            hidden_dim=config['model']['hidden_dim']
+        ).to(device)
 
-                wa_lost += np.sum(np.maximum(d_act - wa_alloc, 0))
-                xgb_lost += np.sum(np.maximum(d_act - xgb_alloc, 0))
+        model.load_state_dict(torch.load(f"results/{file_key}_weights.pth", map_location=device, weights_only=True))
+        model.eval()
 
-    gmv_saved = (xgb_lost * fare) - (wa_lost * fare)
-    improv = (gmv_saved / (xgb_lost * fare)) * 100
+        sq_err_all, abs_err_all = [], []
+        sq_err_clear, sq_err_rain = [], []
 
-    # Calculate final segmented RMSE safely
-    rmse_clear_wa = np.sqrt(mse_clear_wa / count_clear) if count_clear > 0 else 0.0
-    rmse_clear_xgb = np.sqrt(mse_clear_xgb / count_clear) if count_clear > 0 else 0.0
-    rmse_rain_wa = np.sqrt(mse_rain_wa / count_rain) if count_rain > 0 else 0.0
-    rmse_rain_xgb = np.sqrt(mse_rain_xgb / count_rain) if count_rain > 0 else 0.0
+        with torch.no_grad():
+            for batch in test_loader:
+                batch = batch.to(device)
+                pred_scaled = model(batch.x, batch.edge_index, batch.weather, batch.batch)
+                preds = scaler_target.inverse_transform(pred_scaled.cpu().numpy()).flatten()
+                actual = batch.y_raw.cpu().numpy().flatten()
 
-    print("="*50)
-    print("WEATHER-SEGMENTED RMSE RESULTS")
-    print("="*50)
-    if count_clear > 0:
-        print(f"Clear Weather   -> XGBoost RMSE: {rmse_clear_xgb:.3f} | WA-STGAT RMSE: {rmse_clear_wa:.3f}")
-    if count_rain > 0:
-        print(f"Precipitation   -> XGBoost RMSE: {rmse_rain_xgb:.3f} | WA-STGAT RMSE: {rmse_rain_wa:.3f}")
+                sq_err_all.extend((actual - preds)**2)
+                abs_err_all.extend(np.abs(actual - preds))
 
-    print("\n" + "="*50)
-    print("MARKETPLACE SIMULATION RESULTS")
-    print("="*50)
-    print(f"Baseline Unfulfilled Trips : {xgb_lost:,.0f}")
-    print(f"WA-STGAT Unfulfilled Trips : {wa_lost:,.0f}")
-    print("-" * 50)
-    print(f"Preserved Marketplace GMV  : ${gmv_saved:,.2f}")
-    print(f"GMV Recovery Delta         : {improv:.2f}%")
-    print("="*50)
+                for g in range(batch.num_graphs):
+                    s_idx = g * nodes
+                    e_idx = s_idx + nodes
+                    errs = (actual[s_idx:e_idx] - preds[s_idx:e_idx])**2
+
+                    if batch.weather[g][1].item() > 0.0:
+                        sq_err_rain.extend(errs)
+                    else:
+                        sq_err_clear.extend(errs)
+
+        results_table.append({
+            'model': display_name,
+            'rmse': np.sqrt(np.mean(sq_err_all)),
+            'mae': np.mean(abs_err_all),
+            'clear': np.sqrt(np.mean(sq_err_clear)) if sq_err_clear else 0.0,
+            'rain': np.sqrt(np.mean(sq_err_rain)) if sq_err_rain else 0.0
+        })
+
+    # Print Formatted Leaderboard
+    print("\n" + "="*85)
+    print(f"{'MODEL':<28} | {'OVERALL RMSE':<14} | {'MAE':<10} | {'CLEAR RMSE':<12} | {'RAIN RMSE'}")
+    print("="*85)
+    for r in results_table:
+        rain_str = f"{r['rain']:.3f}" if r['rain'] > 0 else "N/A"
+        print(f"{r['model']:<28} | {r['rmse']:<14.3f} | {r['mae']:<10.3f} | {r['clear']:<12.3f} | {rain_str}")
+    print("="*85)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', type=str, default='configs/default.yaml')
-    parser.add_argument('--checkpoint', type=str, default=None)
     args = parser.parse_args()
-    evaluate(args.config, args.checkpoint)
+    evaluate(args.config)
