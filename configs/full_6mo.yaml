@@ -1,0 +1,36 @@
+data:
+  demo_mode: false
+  start_date: "2024-01-01"
+  end_date: "2024-06-30"
+  threshold: 50
+
+model:
+  num_nodes: 263
+  node_features: 7
+  weather_features: 2
+  hidden_dim: 128
+
+training:
+  batch_size: 32
+  learning_rate: 0.001
+  epochs: 100
+  patience: 7
+  max_grad_norm: 1.0
+
+paths:
+  tlc_data: "yellow_tripdata_2024-01.parquet"
+  tlc_data_files:
+    - "yellow_tripdata_2024-01.parquet"
+    - "yellow_tripdata_2024-02.parquet"
+    - "yellow_tripdata_2024-03.parquet"
+    - "yellow_tripdata_2024-04.parquet"
+    - "yellow_tripdata_2024-05.parquet"
+    - "yellow_tripdata_2024-06.parquet"
+  processed_tensor: "data/full_6mo_tensor.parquet"
+  edge_index: "data/full_6mo_edge_index.pt"
+  checkpoint: "results/wa_stgat_weights.pth"
+
+simulation:
+  global_supply_ratio: 0.90
+  fare_per_trip: 18.50
+  sharpening_factor: 1.2

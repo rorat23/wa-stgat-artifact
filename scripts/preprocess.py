@@ -14,17 +14,19 @@ def preprocess(config_path):
 
 
     print("--- 1. Fetching TLC Data ---")
-    file_name = config['paths']['tlc_data']
+    file_names = config['paths'].get('tlc_data_files') or [config['paths']['tlc_data']]
     start_date = config['data']['start_date']
     end_date = config['data']['end_date']
 
+    frames = []
+    for file_name in file_names:
+        if not os.path.exists(file_name):
+            print(f"Downloading NYC TLC Data: {file_name}")
+            urllib.request.urlretrieve("https://d37ci6vzurychx.cloudfront.net/trip-data/" + file_name, file_name)
 
-    if not os.path.exists(file_name):
-        print(f"Downloading NYC TLC Data...")
-        urllib.request.urlretrieve("https://d37ci6vzurychx.cloudfront.net/trip-data/" + file_name, file_name)
+        frames.append(pd.read_parquet(file_name, engine='pyarrow'))
 
-
-    df_temp = pd.read_parquet(file_name, engine='pyarrow')
+    df_temp = pd.concat(frames, ignore_index=True)
     df_temp['tpep_pickup_datetime'] = pd.to_datetime(df_temp['tpep_pickup_datetime'])
     df_temp['tpep_dropoff_datetime'] = pd.to_datetime(df_temp['tpep_dropoff_datetime'])
     df_temp['trip_duration_mins'] = (df_temp['tpep_dropoff_datetime'] - df_temp['tpep_pickup_datetime']).dt.total_seconds() / 60.0
@@ -35,7 +37,7 @@ def preprocess(config_path):
         (df_temp['trip_distance'] > 0) & (df_temp['trip_distance'] < 100) &             
         (df_temp['trip_duration_mins'] >= 1) & (df_temp['trip_duration_mins'] <= 180) &       
         (df_temp['tpep_pickup_datetime'] >= start_date) & 
-        (df_temp['tpep_pickup_datetime'] < '2024-01-04') # Demo boundary
+        (df_temp['tpep_pickup_datetime'] < pd.to_datetime(end_date) + pd.Timedelta(days=1))
     )
     df_clean = df_temp[mask].copy()
     df_clean['time_bin'] = df_clean['tpep_pickup_datetime'].dt.floor('15min')
@@ -104,4 +106,3 @@ if __name__ == "__main__":
     parser.add_argument('--config', type=str, default='configs/default.yaml')
     args = parser.parse_args()
     preprocess(args.config)
-
